@@ -11,11 +11,97 @@
 #include <cstring>
 #include <iostream>
 
-// Typedef matching the System V ABI for the C++ member function
+struct EventQueryBase {
+  void* vtable;            // 0x00
+  VkEvent eventHandle;     // 0x08
+};
+
+// Typedef matching the System V ABI for the C++ member functions
 typedef void (*WaitForPendingPresent_t)(void* _this, int param_2);
-static WaitForPendingPresent_t g_orig_WaitForPendingPresent = nullptr;
+typedef EventQueryBase*(* t_CreateEventQuery)(void* pThis);
+typedef void(* t_ReleaseEventQuery)(void* pThis, EventQueryBase** ppEvent);
+typedef void(* t_InsertEventQuery)(void* pThis, EventQueryBase* pEvent);
+typedef bool(* t_IsEventQueryComplete)(void* pThis, EventQueryBase* pEvent);
+
 static bool g_funchookInstalled = false;
 static bool g_patchInstalled = false;
+
+static WaitForPendingPresent_t g_orig_WaitForPendingPresent = nullptr;
+static t_CreateEventQuery o_CreateEventQuery = nullptr;
+static t_ReleaseEventQuery o_ReleaseEventQuery = nullptr;
+static t_InsertEventQuery o_InsertEventQuery = nullptr;
+static t_IsEventQueryComplete o_IsEventQueryComplete = nullptr;
+
+EventQueryBase* Hook_CreateEventQuery(void* pThis) 
+{
+    VkDevice device = *(VkDevice*)((uintptr_t)pThis + 0xa60);
+
+    EventQueryBase* originalStub = o_CreateEventQuery(pThis);
+    void* facetVtable = originalStub ? originalStub->vtable : nullptr;
+
+    // Destroy the 8-byte stub using the original release function
+    if (originalStub && o_ReleaseEventQuery) {
+        o_ReleaseEventQuery(pThis, &originalStub);
+    }
+
+    EventQueryBase* myEvent = new EventQueryBase();
+    myEvent->vtable = facetVtable;
+
+    VkEventCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+    
+    vkCreateEvent(device, &createInfo, nullptr, &myEvent->eventHandle);
+
+    return myEvent;
+}
+
+void Hook_ReleaseEventQuery(void* pThis, EventQueryBase** ppEvent) 
+{
+    if (ppEvent && *ppEvent) 
+    {
+        EventQueryBase* pEvent = *ppEvent;
+        VkDevice device = *(VkDevice*)((uintptr_t)pThis + 0xa60);
+
+        vkDestroyEvent(device, pEvent->eventHandle, nullptr);
+
+        delete pEvent; 
+        
+        *ppEvent = nullptr;
+    }
+}
+
+void Hook_InsertEventQuery(void* pThis, EventQueryBase* pEvent) 
+{
+    if (!pThis || !pEvent) return;
+
+    VkEvent vkEvent = pEvent->eventHandle;
+
+    VkDevice device = *(VkDevice*)((uintptr_t)pThis + 0xa60);
+
+    uintptr_t pCommandBatch = *(uintptr_t*)((uintptr_t)pThis + 0x12b0);
+    if (!pCommandBatch) return;
+
+    uintptr_t pCmdWrapper = *(uintptr_t*)(pCommandBatch + 0x8);
+    if (!pCmdWrapper) return;
+
+    VkCommandBuffer cmdBuf = *(VkCommandBuffer*)(pCmdWrapper + 0x720);
+    if (!cmdBuf) return;
+
+    vkResetEvent(device, vkEvent);
+    
+    vkCmdSetEvent(cmdBuf, vkEvent, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); 
+}
+
+bool Hook_IsEventQueryComplete(void* pThis, EventQueryBase* pEvent) 
+{
+    if (!pThis || !pEvent) return false;
+
+    VkEvent vkEvent = pEvent->eventHandle;
+
+    VkDevice device = *(VkDevice*)((uintptr_t)pThis + 0xa60);
+
+    return vkGetEventStatus(device, vkEvent) == VK_EVENT_SET; 
+}
 
 void Hook_WaitForPendingPresent(void* _this, int param_2) {
   // Extract the VkDevice from the CHmdWindowSDL object at offset 0xf8
@@ -185,30 +271,117 @@ bool InstallFunchook() {
     }
   }
 
-  if (!target_func) {
-    return false;
-  }
-
-  g_orig_WaitForPendingPresent = (WaitForPendingPresent_t)target_func;
   funchook_t* fhook = funchook_create();
+  bool any_hook_prepared = false;
 
-  int rv = funchook_prepare(fhook, (void**)&g_orig_WaitForPendingPresent, (void*)Hook_WaitForPendingPresent);
-  if (rv != 0) {
-    std::cerr << "funchook_prepare failed: " << funchook_error_message(fhook) << std::endl;
-    funchook_destroy(fhook);
-    return false;
+  if (target_func) {
+    g_orig_WaitForPendingPresent = (WaitForPendingPresent_t)target_func;
+    int rv = funchook_prepare(fhook, (void**)&g_orig_WaitForPendingPresent, (void*)Hook_WaitForPendingPresent);
+    if (rv == 0) {
+      any_hook_prepared = true;
+      std::cerr << "WaitForPendingPresent prepared successfully." << std::endl;
+    } else {
+      std::cerr << "Failed to prepare WaitForPendingPresent: " << funchook_error_message(fhook) << std::endl;
+    }
+  } else {
+    std::cerr << "WaitForPendingPresent target function not resolved." << std::endl;
   }
 
-  rv = funchook_install(fhook, 0);
-  if (rv != 0) {
-    std::cerr << "funchook_install failed: " << funchook_error_message(fhook) << std::endl;
-    funchook_destroy(fhook);
-    return false;
+  // Hook CreateEventQuery
+  const uint8_t pattern_CreateEventQuery[] = {0x55, 0xbf, 0x08, 0x00, 0x00, 0x00, 0x48, 0x89};
+  void* match_CreateEventQuery = nullptr;
+  if (pattern_CreateEventQuery[0] != 0x00) {
+    match_CreateEventQuery = FindPattern(pattern_CreateEventQuery, sizeof(pattern_CreateEventQuery));
+  }
+  if (match_CreateEventQuery) {
+    o_CreateEventQuery = (t_CreateEventQuery)match_CreateEventQuery;
+    int rv = funchook_prepare(fhook, (void**)&o_CreateEventQuery, (void*)Hook_CreateEventQuery);
+    if (rv == 0) {
+      any_hook_prepared = true;
+      std::cerr << "CreateEventQuery prepared successfully." << std::endl;
+    } else {
+      std::cerr << "Failed to prepare CreateEventQuery: " << funchook_error_message(fhook) << std::endl;
+    }
+  } else {
+    std::cerr << "CreateEventQuery pattern not found (placeholder)." << std::endl;
   }
 
-  std::cerr << "Success! WaitForPendingPresent hooked via funchook." << std::endl;
+  // Hook ReleaseEventQuery
+  const uint8_t pattern_ReleaseEventQuery[] = {0x48, 0x85, 0xf6, 0x74, 0x33, 0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x89, 0xf3, 0x48, 0x83, 0xec, 0x08, 0x48, 0x8b, 0x3e, 0x48, 0x85, 0xff, 0x74, 0x0a, 0xbe, 0x08, 0x00, 0x00, 0x00};
+  void* match_ReleaseEventQuery = nullptr;
+  if (pattern_ReleaseEventQuery[0] != 0x00) {
+    void* raw = FindPattern(pattern_ReleaseEventQuery, sizeof(pattern_ReleaseEventQuery));
+    if (raw) {
+      // Advance past the TEST rsi,rsi / JZ rel8 prologue (5 bytes) so that
+      // funchook sees PUSH rbp as the first instruction and can build the
+      // trampoline without encountering an un-fixable 8-bit RIP-relative jump.
+      match_ReleaseEventQuery = (void*)((uintptr_t)raw + 5);
+    }
+  }
+  if (match_ReleaseEventQuery) {
+    o_ReleaseEventQuery = (t_ReleaseEventQuery)match_ReleaseEventQuery;
+    int rv = funchook_prepare(fhook, (void**)&o_ReleaseEventQuery, (void*)Hook_ReleaseEventQuery);
+    if (rv == 0) {
+      any_hook_prepared = true;
+      std::cerr << "ReleaseEventQuery prepared successfully." << std::endl;
+    } else {
+      std::cerr << "Failed to prepare ReleaseEventQuery: " << funchook_error_message(fhook) << std::endl;
+    }
+  } else {
+    std::cerr << "ReleaseEventQuery pattern not found (placeholder)." << std::endl;
+  }
 
-  return true;
+  // Hook InsertEventQuery
+  const uint8_t pattern_InsertEventQuery[] = {0x55, 0x48, 0x89, 0xe5, 0xe8, 0x87, 0x9d, 0xee, 0xff};
+  void* match_InsertEventQuery = nullptr;
+  if (pattern_InsertEventQuery[0] != 0x00) {
+    match_InsertEventQuery = FindPattern(pattern_InsertEventQuery, sizeof(pattern_InsertEventQuery));
+  }
+  if (match_InsertEventQuery) {
+    o_InsertEventQuery = (t_InsertEventQuery)match_InsertEventQuery;
+    int rv = funchook_prepare(fhook, (void**)&o_InsertEventQuery, (void*)Hook_InsertEventQuery);
+    if (rv == 0) {
+      any_hook_prepared = true;
+      std::cerr << "InsertEventQuery prepared successfully." << std::endl;
+    } else {
+      std::cerr << "Failed to prepare InsertEventQuery: " << funchook_error_message(fhook) << std::endl;
+    }
+  } else {
+    std::cerr << "InsertEventQuery pattern not found (placeholder)." << std::endl;
+  }
+
+  // Hook IsEventQueryComplete
+  const uint8_t pattern_IsEventQueryComplete[] = {0x55, 0x48, 0x89, 0xe5, 0xe8, 0x47, 0x9d, 0xee, 0xff};
+  void* match_IsEventQueryComplete = nullptr;
+  if (pattern_IsEventQueryComplete[0] != 0x00) {
+    match_IsEventQueryComplete = FindPattern(pattern_IsEventQueryComplete, sizeof(pattern_IsEventQueryComplete));
+  }
+  if (match_IsEventQueryComplete) {
+    o_IsEventQueryComplete = (t_IsEventQueryComplete)match_IsEventQueryComplete;
+    int rv = funchook_prepare(fhook, (void**)&o_IsEventQueryComplete, (void*)Hook_IsEventQueryComplete);
+    if (rv == 0) {
+      any_hook_prepared = true;
+      std::cerr << "IsEventQueryComplete prepared successfully." << std::endl;
+    } else {
+      std::cerr << "Failed to prepare IsEventQueryComplete: " << funchook_error_message(fhook) << std::endl;
+    }
+  } else {
+    std::cerr << "IsEventQueryComplete pattern not found (placeholder)." << std::endl;
+  }
+
+  if (any_hook_prepared) {
+    int rv = funchook_install(fhook, 0);
+    if (rv != 0) {
+      std::cerr << "funchook_install failed: " << funchook_error_message(fhook) << std::endl;
+      funchook_destroy(fhook);
+      return false;
+    }
+    std::cerr << "Success! funchook installed successfully." << std::endl;
+  } else {
+    funchook_destroy(fhook);
+  }
+
+  return any_hook_prepared;
 }
 
 bool PatchCreateDirectModeSurface() {
