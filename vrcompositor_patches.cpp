@@ -248,6 +248,38 @@ void* FindPattern(const uint8_t* pattern, size_t length) {
   return pm.match;
 }
 
+static int PatternMatchDataCallback(struct dl_phdr_info* info, size_t size, void* data) {
+  if (info->dlpi_name[0] != '\0' && !strstr(info->dlpi_name, "vrcompositor")) {
+    return 0; // Skip other libraries
+  }
+
+  PatternMatch* pm = reinterpret_cast<PatternMatch*>(data);
+
+  for (int i = 0; i < info->dlpi_phnum; ++i) {
+    // Scan non-executable readable segments (rodata, data.rel.ro, etc.)
+    if (info->dlpi_phdr[i].p_type == PT_LOAD && (info->dlpi_phdr[i].p_flags & PF_R) && !(info->dlpi_phdr[i].p_flags & PF_X)) {
+      uint8_t* start = (uint8_t*)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+      size_t len = info->dlpi_phdr[i].p_memsz;
+
+      if (len < pm->length) continue;
+
+      for (size_t j = 0; j <= len - pm->length; ++j) {
+        if (memcmp(start + j, pm->pattern, pm->length) == 0) {
+          pm->match = start + j;
+          return 1; // Found, stop iterating
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+void* FindPatternData(const uint8_t* pattern, size_t length) {
+  PatternMatch pm = {pattern, length, nullptr};
+  dl_iterate_phdr(PatternMatchDataCallback, &pm);
+  return pm.match;
+}
+
 bool InstallFunchook() {
   if (g_funchookInstalled)
     return true;
@@ -331,42 +363,61 @@ bool InstallFunchook() {
     std::cerr << "ReleaseEventQuery pattern not found (placeholder)." << std::endl;
   }
 
-  // Hook InsertEventQuery
-  const uint8_t pattern_InsertEventQuery[] = {0x55, 0x48, 0x89, 0xe5, 0xe8, 0x87, 0x9d, 0xee, 0xff};
+  // Locate the CFacetVRRenderer vtable in data sections using CreateEventQuery (or ReleaseEventQuery)
   void* match_InsertEventQuery = nullptr;
-  if (pattern_InsertEventQuery[0] != 0x00) {
-    match_InsertEventQuery = FindPattern(pattern_InsertEventQuery, sizeof(pattern_InsertEventQuery));
+  void* match_IsEventQueryComplete = nullptr;
+
+  if (match_CreateEventQuery) {
+    uintptr_t target_ptr = (uintptr_t)match_CreateEventQuery;
+    void* vtable_slot = FindPatternData((const uint8_t*)&target_ptr, sizeof(target_ptr));
+    if (vtable_slot) {
+      std::cerr << "Found CFacetVRRenderer vtable slot for CreateEventQuery at " << vtable_slot << std::endl;
+      match_InsertEventQuery = *(void**)((uintptr_t)vtable_slot + 0x08);
+      match_IsEventQueryComplete = *(void**)((uintptr_t)vtable_slot + 0x10);
+    }
   }
+
+  if ((!match_InsertEventQuery || !match_IsEventQueryComplete) && match_ReleaseEventQuery) {
+    // raw ReleaseEventQuery function start is match_ReleaseEventQuery - 5
+    uintptr_t raw_release_ptr = (uintptr_t)match_ReleaseEventQuery - 5;
+    void* vtable_slot = FindPatternData((const uint8_t*)&raw_release_ptr, sizeof(raw_release_ptr));
+    if (vtable_slot) {
+      std::cerr << "Found CFacetVRRenderer vtable slot for ReleaseEventQuery at " << vtable_slot << std::endl;
+      if (!match_InsertEventQuery) {
+        match_InsertEventQuery = *(void**)((uintptr_t)vtable_slot - 0x10);
+      }
+      if (!match_IsEventQueryComplete) {
+        match_IsEventQueryComplete = *(void**)((uintptr_t)vtable_slot - 0x08);
+      }
+    }
+  }
+
+  // Hook InsertEventQuery
   if (match_InsertEventQuery) {
     o_InsertEventQuery = (t_InsertEventQuery)match_InsertEventQuery;
     int rv = funchook_prepare(fhook, (void**)&o_InsertEventQuery, (void*)Hook_InsertEventQuery);
     if (rv == 0) {
       any_hook_prepared = true;
-      std::cerr << "InsertEventQuery prepared successfully." << std::endl;
+      std::cerr << "InsertEventQuery prepared successfully from vtable at " << match_InsertEventQuery << "." << std::endl;
     } else {
       std::cerr << "Failed to prepare InsertEventQuery: " << funchook_error_message(fhook) << std::endl;
     }
   } else {
-    std::cerr << "InsertEventQuery pattern not found (placeholder)." << std::endl;
+    std::cerr << "InsertEventQuery target function not resolved." << std::endl;
   }
 
   // Hook IsEventQueryComplete
-  const uint8_t pattern_IsEventQueryComplete[] = {0x55, 0x48, 0x89, 0xe5, 0xe8, 0x47, 0x9d, 0xee, 0xff};
-  void* match_IsEventQueryComplete = nullptr;
-  if (pattern_IsEventQueryComplete[0] != 0x00) {
-    match_IsEventQueryComplete = FindPattern(pattern_IsEventQueryComplete, sizeof(pattern_IsEventQueryComplete));
-  }
   if (match_IsEventQueryComplete) {
     o_IsEventQueryComplete = (t_IsEventQueryComplete)match_IsEventQueryComplete;
     int rv = funchook_prepare(fhook, (void**)&o_IsEventQueryComplete, (void*)Hook_IsEventQueryComplete);
     if (rv == 0) {
       any_hook_prepared = true;
-      std::cerr << "IsEventQueryComplete prepared successfully." << std::endl;
+      std::cerr << "IsEventQueryComplete prepared successfully from vtable at " << match_IsEventQueryComplete << "." << std::endl;
     } else {
       std::cerr << "Failed to prepare IsEventQueryComplete: " << funchook_error_message(fhook) << std::endl;
     }
   } else {
-    std::cerr << "IsEventQueryComplete pattern not found (placeholder)." << std::endl;
+    std::cerr << "IsEventQueryComplete target function not resolved." << std::endl;
   }
 
   if (any_hook_prepared) {
