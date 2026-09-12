@@ -286,28 +286,26 @@ bool InstallFunchook() {
 
   g_funchookInstalled = true;
 
-  void* target_func = nullptr;
-
   const uint8_t pattern[] = {0x48, 0xba, 0xcf, 0xf7, 0x53, 0xe3, 0xa5, 0x9b, 0xc4, 0x20};
-  void* match = FindPattern(pattern, sizeof(pattern));
+  void* match_WaitForPendingPresent = FindPattern(pattern, sizeof(pattern));
 
-  if (match) {
-    target_func = (void*)((uintptr_t)match - 0xc9);
-    std::cerr << "Found WaitForPendingPresent via pattern at " << target_func << std::endl;
-  } else {
-    const std::string targetSymbol =
-        "_ZN2vr13CHmdWindowSDL21WaitForPendingPresentENS_10IHmdWindow11EWindowTypeE";
-    target_func = FindLocalSymbol(targetSymbol);
-    if (target_func) {
-      std::cerr << "Found WaitForPendingPresent via symbol at " << target_func << std::endl;
-    }
+  uintptr_t location = (uintptr_t)match_WaitForPendingPresent - 0xc9;
+
+  const std::string targetSymbol =
+      "_ZN2vr13CHmdWindowSDL21WaitForPendingPresentENS_10IHmdWindow11EWindowTypeE";
+  g_orig_WaitForPendingPresent = (WaitForPendingPresent_t)FindLocalSymbol(targetSymbol);
+  if (g_orig_WaitForPendingPresent) {
+    std::cerr << "Found WaitForPendingPresent via symbol at " << (void*)location << std::endl;
+  }
+  else if (match_WaitForPendingPresent && *(uint8_t*)location == 0x55) {
+    g_orig_WaitForPendingPresent = (WaitForPendingPresent_t)(location);
+    std::cerr << "Found WaitForPendingPresent via pattern at " << (void*)location << std::endl;
   }
 
   funchook_t* fhook = funchook_create();
   bool any_hook_prepared = false;
 
-  if (target_func) {
-    g_orig_WaitForPendingPresent = (WaitForPendingPresent_t)target_func;
+  if (g_orig_WaitForPendingPresent) {
     int rv = funchook_prepare(fhook, (void**)&g_orig_WaitForPendingPresent, (void*)Hook_WaitForPendingPresent);
     if (rv == 0) {
       any_hook_prepared = true;
