@@ -15,6 +15,28 @@ A Vulkan layer that patches SteamVR's vrcompositor to address issues for wired h
 - Frame rate issues
 - Any issues with SteamVR that this layer does not promise to fix
 
+## Vblank alignment for NVIDIA (opt-in)
+
+On NVIDIA's proprietary driver (seen on 570 and later, measured on 610.57.04 with an RTX 5090), a FIFO present to a direct-mode (DRM-leased) display is shown as soon as its rendering completes instead of at the next vblank. SteamVR hands frames over about 4 ms before vsync, so the panel switches images partway through its scanout. In the headset this is a horizontal line where the lower part of the image lags behind the upper part while you turn your head. It is the same problem as the "Tearing in VR since 570.x" reports on the NVIDIA forums, and it happens with or without VRR.
+
+The layer can hold each headset frame and present it just before the next vsync, so the switch lands in the vertical blanking interval where it cannot be seen:
+
+- Vsync times come from the first-pixel-out display event fences vrcompositor already waits on.
+- `vkQueuePresentKHR` returns immediately, and a worker thread makes the real present at the release time. SteamVR's frame timing is unchanged. (Holding vrcompositor's own thread instead made SteamVR start frames much earlier, which broke the PS VR2 controllers' LED sync at 120 Hz.)
+- Every queue and swapchain call vrcompositor makes goes through one mutex, so the worker never touches them concurrently.
+- The release lead is fixed. Steering it from measured landings is unstable: a frame released too close to vsync is held a whole extra frame.
+
+Enable it by creating the file below, containing the lead in microseconds (1200 works at 90 and 120 Hz on a PS VR2), then restart SteamVR:
+
+```bash
+mkdir -p ~/.config/steamvr-linux-fixes
+echo 1200 > ~/.config/steamvr-linux-fixes/align
+```
+
+Delete the file to turn it off. The layer logs statistics to `vrcompositor-linux.txt` every 600 frames: where frames landed against vsync, how long they were held, and how many landed outside the blanking interval.
+
+For diagnosis, creating `~/.config/steamvr-linux-fixes/trace` records present, present-wait and vsync timings to `~/.cache/steamvr-linux-fixes/vrcompositor-timing.csv`.
+
 ## How to use
 
 If you are on Arch, you can just install [steamvr-linux-fixes-layer-bin](https://aur.archlinux.org/packages/steamvr-linux-fixes-layer-bin) from AUR.

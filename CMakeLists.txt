@@ -15,7 +15,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(FUNCHOOK_INSTALL OFF CACHE BOOL "Install Funchook" FORCE)
 add_subdirectory(funchook)
 
-add_library(steamvr_linux_fixes SHARED steamvr_linux_fixes.cpp vulkan_hooks.cpp vrcompositor_patches.cpp)
+add_library(steamvr_linux_fixes SHARED steamvr_linux_fixes.cpp vulkan_hooks.cpp vrcompositor_patches.cpp timing_trace.cpp vblank_align.cpp present_defer.cpp)
 
 target_include_directories(steamvr_linux_fixes PRIVATE ${Vulkan_INCLUDE_DIRS} funchook)
 

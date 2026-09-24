@@ -1,5 +1,7 @@
 #include "steamvr_linux_fixes.hpp"
 #include "vulkan_hooks.hpp"
+#include "timing_trace.hpp"
+#include "present_defer.hpp"
 #include "vrcompositor_patches.hpp"
 
 #include <cstring>
@@ -85,6 +87,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Hook_vkGetDeviceProcAddr(VkDevice devic
       return (PFN_vkVoidFunction)Hook_vkCreateSwapchainKHR;
     if (strcmp(pName, "vkCreateImage") == 0)
       return (PFN_vkVoidFunction)Hook_vkCreateImage;
+    if (PFN_vkVoidFunction deferHook = DeferGetDeviceProcAddr(pName))
+      return deferHook;
+    if (PFN_vkVoidFunction traced = TraceGetDeviceProcAddr(pName))
+      return traced;
   }
 
   PFN_vkGetDeviceProcAddr next_gdpa = nullptr;

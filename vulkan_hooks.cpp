@@ -1,5 +1,8 @@
 #include "vulkan_hooks.hpp"
 #include "steamvr_linux_fixes.hpp"
+#include "timing_trace.hpp"
+#include "vblank_align.hpp"
+#include "present_defer.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -272,9 +275,14 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(VkDevice device,
   // Ensure color bit is added.
   modifiedInfo.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
+  // SteamVR creates the headset swapchain with FIFO. With vblank alignment on,
+  // it keeps that mode: alignment was verified with FIFO, and it decides when
+  // each frame is presented itself.
+  bool hmdAligned = pCreateInfo->presentMode == VK_PRESENT_MODE_FIFO_KHR && AlignEnabled();
+
   // Try to switch to FIFO_LATEST_READY if available
   do {
-    if (physDev == VK_NULL_HANDLE) {
+    if (hmdAligned || physDev == VK_NULL_HANDLE) {
       break;
     }
     VkInstance instance = g_physDevToInstance[physDev];
@@ -305,7 +313,13 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkCreateSwapchainKHR(VkDevice device,
     }
   } while (0);
 
-  return next_create(device, &modifiedInfo, pAllocator, pSwapchain);
+  VkResult created = next_create(device, &modifiedInfo, pAllocator, pSwapchain);
+  if (created == VK_SUCCESS && hmdAligned)
+    AlignSetHmdSwapchain(*pSwapchain);
+  if (created == VK_SUCCESS)
+    Trace("create_swapchain", (uint64_t)*pSwapchain,
+          ((uint64_t)modifiedInfo.imageExtent.width << 32) | modifiedInfo.imageExtent.height);
+  return created;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
@@ -329,6 +343,11 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(VkQueue queue, const VkPre
   }
 
   g_lastSwapchain = (pPresentInfo->swapchainCount > 0) ? pPresentInfo->pSwapchains[0] : VK_NULL_HANDLE;
+  Trace("queue_present", (uint64_t)g_lastSwapchain, g_presentCounter.load());
+
+  // Headset frames are handed to a worker that presents them just before the
+  // next vsync, so they are shown inside the vertical blank.
+  bool deferred = pPresentInfo->swapchainCount == 1 && AlignEnabled() && AlignIsHmdSwapchain(g_lastSwapchain);
 
   // Scan the pNext chain to see if SteamVR already provided a Present ID
   const VkPresentIdKHR* existingPid = nullptr;
@@ -344,7 +363,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(VkQueue queue, const VkPre
   if (existingPid && existingPid->swapchainCount > 0 && existingPid->pPresentIds) {
     // SteamVR already injected the ID. (currently SteamVR doesn't do this)
     g_currentPresentId = existingPid->pPresentIds[0];
-    return next_present(queue, pPresentInfo);
+    if (deferred && existingPid->pNext == nullptr && pPresentInfo->pNext == existingPid &&
+        DeferPresent(next_present, queue, pPresentInfo, existingPid->pPresentIds[0]))
+      return VK_SUCCESS;
+    return PresentLocked(next_present, queue, pPresentInfo);
   } else {
     // SteamVR didn't inject one. We must append it ourselves.
     uint64_t currentId = g_presentCounter.fetch_add(1);
@@ -361,6 +383,8 @@ VKAPI_ATTR VkResult VKAPI_CALL Hook_vkQueuePresentKHR(VkQueue queue, const VkPre
 
     g_currentPresentId = currentId;
 
-    return next_present(queue, &mod);
+    if (deferred && pPresentInfo->pNext == nullptr && DeferPresent(next_present, queue, &mod, currentId))
+      return VK_SUCCESS;
+    return PresentLocked(next_present, queue, &mod);
   }
 }
