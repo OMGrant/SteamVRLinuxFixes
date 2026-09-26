@@ -1,5 +1,26 @@
 # SteamVR Linux Fixes
 
+## About this fork
+
+This fork adds one feature to SteamVR Linux Fixes: **vblank alignment for NVIDIA direct mode**. It was offered upstream as [PR #3](https://github.com/BnuuySolutions/SteamVRLinuxFixes/pull/3) and declined as out of scope for a layer meant to stay small and temporary, so it lives here.
+
+**The problem.** On NVIDIA's proprietary driver, a FIFO present to a leased (direct mode) headset display is shown as soon as its rendering finishes instead of at the next vblank. SteamVR hands frames over a few milliseconds before vsync, so the panel switches images partway through its scanout. In the headset this is a horizontal line where the lower part of the image lags behind the upper part while you turn your head. The upstream maintainer's explanation: when any connected display is VRR-capable, the NVIDIA driver treats every display surface like a VRR one and presents immediately. The same line shows up in the NVIDIA forum thread "Tearing in VR since 570.x".
+
+**What this fork does.** It holds each headset frame and presents it just before the next vsync, so the image switch lands in the vertical blank where it can't be seen. SteamVR's own timing is left alone: its present call returns at once and a worker thread does the real present. The README section "Vblank alignment for NVIDIA (opt-in)" below has the details and the measurements.
+
+**Turning it on.** It is off unless you ask for it:
+
+```bash
+mkdir -p ~/.config/steamvr-linux-fixes
+echo 1200 > ~/.config/steamvr-linux-fixes/align
+```
+
+Then restart SteamVR. Delete the file to turn it off.
+
+**Alternatives without this fork.** Hiding VRR from the NVIDIA driver entirely (the `nvidia-modeset` option `conceal_vrr_caps=1`) should avoid the problem too, at the cost of VRR on your desktop monitors. The upstream maintainer has mentioned a possible future layer that patches the driver's behaviour directly.
+
+Tested on an RTX 5090 with driver 610.57.04 and a PS VR2 (Ignition and PSVR2 Toolkit) at 90 and 120 Hz, on KDE Plasma with Wayland.
+
 A Vulkan layer that patches SteamVR's vrcompositor to address issues for wired headsets (Vive, Index, Beyond, PSVR2, etc).
 
 ## What this does fix
